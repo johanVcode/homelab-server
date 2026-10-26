@@ -2,96 +2,181 @@
 
 My old gaming rig, rebuilt into a Proxmox VE server where I learn by building, breaking and rebuilding.
 
-> **Motto: zero trust, scalable, reliable, and documented** — documented so clearly that someone who has never seen the system can follow it without guessing.
+> **TL;DR:** A bare-metal Proxmox VE 9 host on ZFS with two minimal templates (Debian 13 and Oracle Linux 10) and two clones built from them: a **GPU passthrough desktop** with real hardware isolation, and an **Oracle Database lab** running in rootless Podman under SELinux. Every claim below has a screenshot behind it.
+
+**What I aim for:** zero trust, scalable, reliable, and documented — so clearly that someone who has never seen the system can follow it without guessing. I don't always get there. Where I fall short is in [Known limitations](#known-limitations), and any improvement is welcome as an [issue](../../issues).
+
+> **Sanitized on purpose:** usernames, MAC addresses and public IPs are hidden in the screenshots.
+
+**Where DBA fits in:** I'm studying to become a DBA. A database is only as reliable as the server, storage, network and security underneath it, and that's the layer I practice here. I want to be the DBA who understands the whole stack, not just the SQL.
+
+**How this was built:** I followed guides and documentation, with an LLM as a sounding board. The key decisions were mine, like isolating the GPU in hardware instead of using the ACS override. I reinstalled Proxmox several times before I understood ZFS and snapshots, and every reinstall taught me something.
 
 ---
 
-## Why this server matters to me
+## Design decisions
 
-The first time Proxmox actually worked, it was a pure "it's alive!" Frankenstein moment. This is **my** machine: I built it, I control every layer of it, and nobody else decides how it runs. It felt like getting a third eye, suddenly seeing everything that happens underneath the operating systems I had only used before.
+### 1. A type 1 hypervisor, not a desktop app
 
-**Where DBA fits in:** I'm studying to become a DBA, and this server is where the two worlds meet. A database is only as reliable as the server, storage, network and security underneath it, and that's exactly the layer I practice here. My Oracle Linux template will be the base for my database lab, running Oracle Database in containers the same way we work in class. I want to be the DBA who understands the whole stack, not just the SQL.
+I wanted to run VMs the way production does: a bare-metal hypervisor with KVM, ZFS, templates and clustering built in, open source and with no license costs. That's Proxmox.
 
-**And honestly:** the more I learn, the more I see how much there is. It feels like I've taken a glass of water from the fountain of knowledge, then turned around and seen the ocean. That didn't scare me away. It put me in awe. I have a lot to learn, and I want to learn it from experienced professionals, with the same enthusiasm that got this server running in the first place.
+![Proxmox version, VM list, CPU and memory](Images/screenshot-hypervisor-001-overview.png)
+*Proxmox VE 9.2, two running clones and two stopped templates on an i7-10700K (8 cores, 16 threads, VT-x) with 32 GB RAM.*
+
+### 2. GPU passthrough with real isolation, not the ACS override
+
+A GPU can only be passed to a VM safely when it sits alone in its **IOMMU group**. Mine shared a group with the NVMe drive. The common fix is the ACS override, which only makes Linux *pretend* the devices are isolated. I chose real isolation instead:
+
+1. Enabled VT-d in the BIOS, which made the IOMMU groups visible.
+2. Found the NVMe in the GPU's group.
+3. **Moved the NVMe to a chipset-connected slot.**
+4. Checked again: the GPU was alone in its group.
+5. Bound all four GPU functions to `vfio-pci`.
+
+![IOMMU groups](Images/screenshot-hypervisor-004-iommu.png)
+*Group 1 holds only the CPU's PCIe port and the GPU's four functions. The NVMe sits alone in group 14.*
+
+![GPU bound to vfio-pci](Images/screenshot-hypervisor-003-gpu.png)
+*All four functions (video, audio, USB, USB-C) use `vfio-pci`. `intel_iommu=on` isn't in the boot line, because current Proxmox kernels enable the Intel IOMMU by default.*
+
+![nvidia-smi inside the VM](Images/screenshot-vm101-002-gpu.png)
+*The end-to-end proof: the GTX 1660 Super working inside the VM with the NVIDIA driver.*
+
+### 3. Templates and linked clones: cattle, not pets
+
+I built minimal, headless templates for **Debian 13** and **Oracle Linux 10** (2 vCPU, 2 GB RAM, 10 GB disk). New VMs are **linked clones**: they store only their own changes on top of the template, and are sized up only as far as the job needs. When one breaks or has done its job, I throw it away and clone a fresh one.
+
+| VM | From template | Sized for | Purpose |
+|---|---|---|---|
+| 101 dangelo-barksdale | 9100 Debian 13 | 6 vCPU, 8 GB, 24 GB | GPU desktop with XFCE, driving my TV |
+| 102 oracle-DBA26 | 9200 Oracle Linux 10 | 2 vCPU, 8 GB, 50 GB | Oracle Database lab, used for my [SQL coursework](https://github.com/johanVcode/the_skool_johan_v) |
+
+<details>
+<summary>VM configurations</summary>
+
+![VM 101 config](Images/screenshot-vm101-001-config.png)
+*`hostpci0` passes the whole GPU, `ovmf` + `q35` is the standard passthrough setup, and `balloon: 0` pins the memory as passthrough requires. The disk names show it's a linked clone of template 9100.*
+
+![VM 102 config](Images/screenshot-vm102-001-config.png)
+*A linked clone of template 9200. RAM and disk are raised for the database, and the CPU stays at the template's 2 cores.*
+
+</details>
+
+### 4. Versioned ZFS snapshots before every big change
+
+Every milestone gets a numbered snapshot: `001_fresh-install` on the host, `v001` → `v003` on the GPU desktop, and `v001` → `v002` on the database VM. A failed change rolls back in minutes.
+
+![ZFS pool and snapshots](Images/screenshot-hypervisor-002-zfs.png)
+*Healthy pool with no errors, the template and clone disks, and the snapshot history.*
+
+### 5. Least privilege inside the VMs
+
+**Oracle Linux (database lab):** Oracle Database runs in **rootless Podman** under **SELinux in enforcing mode**, and every container gets its own SELinux label. The database port is bound to `127.0.0.1`, so it's only reachable from inside the VM, not from the network.
+
+![SELinux and rootless Podman](Images/screenshot-vm102-002-podman.png)
+*`Enforcing`, `Rootless: true`, the container's label `container_t:s0:c544,c824`, and port 1521 bound to localhost only.*
+
+**Debian (desktop):** a Bash script I wrote myself sets up updates, **ufw** (deny incoming by default) and **fail2ban**. AppArmor runs with Debian's default profiles.
+
+![ufw and fail2ban](Images/screenshot-vm101-003-firewall.png)
+
+<details>
+<summary>AppArmor and SSH</summary>
+
+![AppArmor status](Images/screenshot-vm101-004-apparmor.png)
+*15 profiles enforce and 4 running processes are covered. Writing my own profiles is something I want to learn next.*
+
+![SSH on dangelo-barksdale](Images/screenshot-vm101-005-ssh.png)
+![SSH on oracle-DBA26](Images/screenshot-vm102-003-ssh.png)
+*Key-only login and no root login on both VMs. On oracle-DBA26 this is set in a `00-hardening.conf` drop-in, so package updates can't override it.*
+
+</details>
+
+**How I work:** VS Code connects to the database VM over Remote-SSH and opens `~/projects`, where my repos live. That folder is mounted into the Oracle container, so SQL files are edited in VS Code and run by the database without copying anything.
 
 ---
 
-## Why Proxmox
+## Known limitations
 
-I wanted to run VMs the way production environments do: a bare-metal hypervisor (type 1) instead of a desktop app, built to be deployable, scalable and reliable. Proxmox gave me that with open-source tooling, KVM, ZFS built in, and templates and clustering included, with no license costs.
-
----
-
-## What I've done so far
-
-### GPU passthrough, done the real way
-
-My NVMe drive shared an IOMMU group with the GPU, which blocks passthrough. Instead of the common ACS override hack, which only makes Linux *pretend* the devices are isolated, I **moved the NVMe to a chipset-connected slot** for real isolation at the hardware level. Then I verified the groups by hand and bound all four of the GPU's functions to `vfio-pci`.
-
-### Templates: VMs I can throw away
-
-I built minimal, right-sized templates for **Debian 13** and **Oracle Linux 10** (2 vCPU, 2 GB RAM, 10 GB disk, headless). New VMs are a clone away, and when one breaks or has done its job, I throw it away and spin up a fresh one. Cattle, not pets.
-
-### Linux experience
-
-I have early, hands-on experience with **Debian** and **Oracle Linux**. On the Oracle side I fell in love with **SELinux** and `semanage`: the idea that every process gets exactly the access it needs, and nothing else. Looking for the equivalent on Debian, I found **AppArmor**, and realized it has a whole set of tools of its own for building and managing profiles. Two different approaches to the same principle: least privilege, enforced by the kernel.
-
-On Oracle Linux I also discovered **Podman**, and I was impressed by how it works together with SELinux. Containers run **rootless**, with no background daemon holding root rights, and SELinux labels keep each container inside its own boundaries. Less running as root means less to attack, the same thinking behind my firewall.
-
-### Hardening baseline (work in progress)
-
-My first Bash script, written without help, automates the basics on a fresh Debian VM: system updates, the ufw firewall and fail2ban. Next comes auditd, unattended upgrades and regular Lynis audits, and then turning it all into an Ansible role.
-
-On my Debian VMs I use **etckeeper**, which tracks every change to `/etc` in Git. A small hook exports only the install log, never file contents, so I keep a record of what I've installed without leaking configuration or keys.
+- **The Proxmox firewall is off.** The VMs' network cards are flagged for it, but it isn't enabled at datacenter level, so the only thing between the VMs is my OPNsense firewall, and on the same bridge they can reach each other directly.
+- **ZFS runs on a single NVMe.** ZFS can *detect* corruption but can't *repair* it without a second copy, and there are no backups to another machine yet.
+- **SSH on the Debian VM is open to the whole LAN,** not only my admin devices.
+- **The whole `~/projects` folder is mounted into the database container,** for convenience. The container can read all my repos.
+- **The Oracle image uses the `:latest` tag,** so a new pull can change the environment. Production would pin an exact version.
 
 ---
 
-## Design philosophy: build once, deploy anywhere
+## Self-audit, 2026-10-26
 
-I don't want one hand-tuned machine per job. My goal is a **portable toolkit**:
+I collected evidence from the host and both VMs (the screenshots on this page) and checked it against this README.
 
-- **Templates** for headless Debian and Oracle Linux, ready in minutes.
-- **Ansible playbooks** that tune them, kept in Git and small enough to carry on a USB stick.
-- From there: **deploy 50 VMs** from a template and configure all of them with one playbook, the same way on any rack.
-
-The same recipe, every time, with no human error in between. That's my motto in practice: scalable, reliable and documented.
-
----
-
-## Next steps
-
-1. **Database lab:** an Oracle Linux clone running Oracle Database Free in rootless Podman, sized up from the template as the database needs it.
-2. **Learn Ansible:** start by turning my Debian hardening script into a reusable role.
-3. **Cloud-Init**, so every clone sets its own hostname, user and SSH keys automatically.
-4. **GPU VM, my "golden jewel":** a Debian clone with the passed-through GPU, the NVIDIA driver and XFCE, driving my 60-inch TV as a daily desktop.
-5. **Backups** to a separate machine.
-6. **Isolate lab VMs** on their own VLAN once the network supports it.
+- **Fixed:** oracle-DBA26 allowed root login with an SSH key (OpenSSH's default). Disabled with a `00-hardening.conf` drop-in, verified with `sshd -T`, and tested with a fresh login.
+- **Fixed:** two finished projects, the GPU desktop and the database lab, were still listed as next steps.
+- **Removed:** a claim about etckeeper that was no longer true.
+- **Found, not fixed yet:** the Proxmox firewall is off, and SSH on the Debian VM is open to the whole LAN. Both are listed under Known limitations.
 
 ---
 
-## Hardware
+## Roadmap
+
+1. **Backups to a separate machine,** which also covers the single-disk risk.
+2. **Enable the Proxmox firewall,** and limit SSH to my admin devices.
+3. **Learn Ansible:** turn my hardening script into a reusable role, and publish the script here.
+4. **Cloud-Init,** so every clone sets its own hostname, user and SSH keys automatically.
+5. **Mount one project at a time** into the database container, and pin the Oracle image version.
+6. **Move lab VMs to their own VLAN** once my new switch is in place ([homelab-network](https://github.com/johanVcode/homelab-network)).
+
+The long-term goal is a **portable toolkit**: templates plus Ansible playbooks in Git, so I could deploy 50 VMs and configure them all the same way, on any rack.
+
+---
+
+## What I'm still asking
+
+- When does a business choose bare-metal databases over VMs or containers, and why?
+- How do professionals back up a ZFS-based hypervisor without stopping the VMs?
+
+If you have answers, I'd love to hear them.
+
+---
+
+## Reference
+
+<details>
+<summary><b>Hardware</b></summary>
 
 | Part | Choice |
 |---|---|
-| CPU | Intel i7-10700K (integrated graphics for the host) |
+| CPU | Intel i7-10700K, 8 cores / 16 threads (integrated graphics for the host) |
 | Motherboard | ASUS ROG Strix Z590-E |
 | RAM | 32 GB DDR4 |
-| Storage | 500 GB NVMe, ZFS |
+| Storage | 500 GB Kingston NV3 NVMe, ZFS (single disk) |
 | GPU | NVIDIA GTX 1660 Super (passthrough) |
-| Network | 2 × Intel 2.5 GbE |
+| Network | 2 × Intel I225-V 2.5 GbE (one in use) |
 
----
+</details>
 
-## How I learned
+<details>
+<summary><b>Host network</b></summary>
 
-Getting Proxmox to run properly took me a while. I reinstalled it several times, because I didn't yet understand some of the settings, or the real power of ZFS and snapshots. Every reinstall taught me something, and that trial and error is a big part of how I learn.
+![Host network and Proxmox firewall status](Images/screenshot-hypervisor-005-network.png)
+*One bridge (`vmbr0`) on the LAN, and the Proxmox firewall status: disabled, as listed in the limitations.*
 
-Alongside testing, I learned from:
+</details>
 
-- **[Barmine Tech](https://www.youtube.com/@BarmineTech):** calm, hype-free Proxmox guides, from full setups to short how-tos
-- **[Altsito](https://www.youtube.com/@noclipalt):** short, no-AI security basics (tmux, nmap) with clear ethics: only test your own gear
-- **[The official Proxmox VE documentation](https://pve.proxmox.com/pve-docs/)**
-- **[The Arch Wiki](https://wiki.archlinux.org/):** explains how Linux works, not just which buttons to press
-- Reading, searching and testing until it made sense
+<details>
+<summary><b>Sources</b></summary>
 
-**My personal graduation exam:** installing Arch Linux by hand, with no installer babysitting me. Building a system from the ground up is the best way I know to prove to myself that I understand every layer. Not as a daily driver, but as a test of what I've learned.
+**Main source: the [ArchWiki](https://wiki.archlinux.org/).** Proxmox runs on Debian, and the ArchWiki explains how Linux itself works (systemd, daemons, kernel modules, SSH), so nearly everything translates directly. The main difference is the package manager: `pacman` on Arch, `apt` on Debian and `dnf` on Oracle Linux. Key pages:
+
+- [PCI passthrough via OVMF](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF): IOMMU groups and `vfio-pci`
+- [OpenSSH](https://wiki.archlinux.org/title/OpenSSH), together with `man sshd_config`: SSH hardening
+- [systemd](https://wiki.archlinux.org/title/Systemd): services and daemons
+
+**Also used:**
+
+- [Debian Wiki: VGA Passthrough](https://wiki.debian.org/VGAPassthrough): GPU passthrough on Debian
+- [Proxmox VE documentation](https://pve.proxmox.com/pve-docs/): Proxmox-specific parts, like templates, linked clones and ZFS storage
+- [Podman documentation](https://docs.podman.io/): rootless containers
+- Guides and video tutorials, with an LLM as a sounding board
+
+</details>
